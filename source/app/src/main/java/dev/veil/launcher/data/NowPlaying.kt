@@ -51,16 +51,34 @@ class NowPlaying(private val context: Context) {
     private val component = ComponentName(context, MediaListener::class.java)
     private val handler = Handler(Looper.getMainLooper())
     private var controllers: List<MediaController> = emptyList()
-    /** Art for the current song: (song key, small, large). Only ever holds real artwork. */
-    private var artCache: Triple<String, ImageBitmap, ImageBitmap>? = null
+    /**
+     * Resized art for one song. [isIcon] marks the app-icon fallback (used when the player offers no
+     * artwork at all, e.g. Spotify ads): the real cover replaces it as soon as it turns up.
+     */
+    private class Art(
+        val key: String,
+        val small: ImageBitmap,
+        val large: ImageBitmap,
+        val isIcon: Boolean = false,
+        /** Fingerprint of the bitmap it was made from: players sometimes re-send the previous cover. */
+        val sig: Long = 0,
+    )
+    private var artCache: Art? = null
     /** Song whose artwork hasn't arrived yet, and since when. */
     private var missingArtKey: String? = null
     private var missingArtSince = 0L
     private val recheck = Runnable { recompute() }
     /** Album art is resized here, off the UI thread (song changes stay smooth). */
     private val artWorker = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "veil-art").apply { isDaemon = true } }
-    /** The song whose artwork is being resized right now. */
-    private var artPending: String? = null
+    /** Song on screen at the last [recompute]: a resize finished for anything else is dropped. */
+    private var displayedArtKey: String? = null
+    /** Cover queued for resizing, and the fingerprint it was announced with: players re-report the
+     *  same song many times a second, but a changed picture for the same song must re-queue. */
+    private var artInFlightKey: String? = null
+    private var artInFlightSig = 0L
+    /** Fingerprint of the real cover of each of the last few songs. A report holding another song's
+     *  picture is the previous cover re-sent between tracks, not the new song's art. */
+    private val recentSigs = LinkedHashMap<String, Long>()
     /** Re-evaluates when a paused session reaches the hide time. */
     private val hideCheck = Runnable { recompute() }
     /** When we first saw each app paused (fallback if the player doesn't timestamp its state). */
@@ -86,6 +104,8 @@ class NowPlaying(private val context: Context) {
     fun stop() {
         handler.removeCallbacks(recheck)
         handler.removeCallbacks(hideCheck)
+        artInFlightKey = null
+        artInFlightSig = 0L
         runCatching { msm.removeOnActiveSessionsChangedListener(sessionsListener) }
         controllers.forEach { runCatching { it.unregisterCallback(callback) } }
         controllers = emptyList()
@@ -135,60 +155,109 @@ class NowPlaying(private val context: Context) {
         val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST)
             ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE)
             ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
-        val artKey = "${c.packageName}|$title|$artist"
-        var small: ImageBitmap? = null
-        var large: ImageBitmap? = null
-        val cached = artCache?.takeIf { it.first == artKey }
-        if (cached != null) {
-            small = cached.second; large = cached.third
-        } else {
-            val bmp: Bitmap? = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
-                ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        fun keyOf(pkg: String, title: String, artist: String?) = "$pkg|$title|$artist"
+        val artKey = keyOf(c.packageName, title, artist)
+        // The cover we're currently showing belongs to this song: the only case where carrying it over is honest.
+        val sameSong = track?.let { keyOf(it.pkg, it.title, it.artist) == artKey } ?: false
+        displayedArtKey = artKey
+        // Real artwork only. The app icon is a last resort when nothing else is on offer: players
+        // (Spotify especially, on ads and between tracks) often send only the icon for a moment before
+        // the cover, and showing that first read as "wrong image".
+        val cover: Bitmap? = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        val icon = cover ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        val sig = fingerprintOf(cover)
+        // A picture another recent song was announced with is the previous cover re-sent (players do
+        // this between tracks), not this song's art — unless the song genuinely shares the cover.
+        val stale = sig != 0L && recentSigs.any { (k, s) -> k != artKey && s == sig }
+        // Same song *and* same picture — or the cached real cover while the player re-sends the
+        // previous one: nothing to do. Anything else (new song, or the player swapped the artwork)
+        // is rebuilt, so artwork follows the player instead of sticking for the song.
+        val cached = artCache?.takeIf {
+            it.key == artKey && (!it.isIcon || cover == null) &&
+                (it.sig == sig || (stale && !it.isIcon) || (cover == null && !it.isIcon))
+        }
+        var small: ImageBitmap? = cached?.small
+        var large: ImageBitmap? = cached?.large
+        if (cached == null) {
             fun scaled(b: Bitmap, size: Int): ImageBitmap? {
                 val s = minOf(size, maxOf(b.width, b.height))
                 return runCatching { Bitmap.createScaledBitmap(b, s, s, true).asImageBitmap() }.getOrNull()
             }
+            fun save(s96: ImageBitmap, s640: ImageBitmap, isIcon: Boolean, sig: Long = 0) {
+                artCache = Art(artKey, s96, s640, isIcon, sig)
+                if (!isIcon && sig != 0L) {
+                    recentSigs[artKey] = sig
+                    while (recentSigs.size > 4) recentSigs.remove(recentSigs.keys.first())
+                }
+                missingArtKey = null
+                handler.removeCallbacks(recheck)
+            }
+            val now = System.currentTimeMillis()
+            if (stale && missingArtKey != artKey) { missingArtKey = artKey; missingArtSince = now }
+            // Within a short grace the re-sent picture still counts as "the cover hasn't arrived
+            // yet"; after it the picture is accepted (covers genuinely shared by tracks of one album).
+            val waitForArt = stale && now - missingArtSince < 1_500
             when {
-                bmp != null && track != null -> {
-                    // Resize on the worker; until it's done (a few ms) keep the current cover, as in the
-                    // "artwork arrives a moment later" case below. (The very first song is resized right away.)
-                    if (artPending != artKey) {
-                        artPending = artKey
+                cover != null && !waitForArt -> {
+                    // Resize on the worker (players re-report the same song many times a second, so
+                    // only one job at a time — but a changed picture re-queues); the art shows up on
+                    // the recompute that follows.
+                    if (artInFlightKey != artKey || artInFlightSig != sig) {
+                        artInFlightKey = artKey
+                        artInFlightSig = sig
                         artWorker.execute {
-                            val s96 = scaled(bmp, 96); val s640 = scaled(bmp, 640)
+                            val s96 = scaled(cover, 96); val s640 = scaled(cover, 640)
                             handler.post {
-                                if (artPending == artKey) artPending = null
-                                if (s96 != null && s640 != null) {
-                                    artCache = Triple(artKey, s96, s640)
-                                    missingArtKey = null
-                                    handler.removeCallbacks(recheck)
+                                // Still the latest request for this song? (A newer song or a newer
+                                // picture re-queued meanwhile: this late result must not save, or it
+                                // would show the previous song's cover.)
+                                val latest = artInFlightKey == artKey && artInFlightSig == sig
+                                if (latest) { artInFlightKey = null; artInFlightSig = 0L }
+                                if (s96 != null && s640 != null && latest && displayedArtKey == artKey) {
+                                    save(s96, s640, false, sig)
                                 }
                                 if (controllers.isNotEmpty()) recompute() // not after stop()
                             }
                         }
                     }
-                    small = track?.art; large = track?.artLarge
+                    // Another song's cover is never carried over; for this same song keep it until the
+                    // resized one lands (avoids flashing the placeholder on every state update).
+                    if (sameSong) { small = track?.art; large = track?.artLarge }
                 }
-                bmp != null -> {
-                    small = scaled(bmp, 96); large = scaled(bmp, 640)
-                }
-            }
-            if (bmp != null && track != null) {
-                // Published below with the current cover; the resized one follows from the worker.
-            } else if (small != null && large != null) {
-                artCache = Triple(artKey, small, large)
-                missingArtKey = null
-                handler.removeCallbacks(recheck)
-            } else {
-                // Players often send the new title first and the artwork a moment later. Keep the
-                // previous cover for up to 4 s instead of flashing a placeholder, then give up.
-                val now = System.currentTimeMillis()
-                if (missingArtKey != artKey) { missingArtKey = artKey; missingArtSince = now }
-                if (now - missingArtSince < 4_000) {
-                    small = track?.art; large = track?.artLarge
+                cover != null -> {
+                    // The previous song's cover, still held (or re-sent) for this one: wait for a
+                    // different picture. A new song shows the placeholder — it reads as "loading",
+                    // not as "wrong song".
+                    if (sameSong) { small = track?.art; large = track?.artLarge }
                     handler.removeCallbacks(recheck)
-                    handler.postDelayed(recheck, 4_100)
+                    handler.postDelayed(recheck, 300)
+                }
+                icon != null -> {
+                    // Only the app icon so far: wait briefly for the real cover (players usually send it a
+                    // moment later) instead of flashing the icon.
+                    if (missingArtKey != artKey) { missingArtKey = artKey; missingArtSince = now }
+                    if (now - missingArtSince >= 2_000) {
+                        val s96 = scaled(icon, 96); val s640 = scaled(icon, 640)
+                        if (s96 != null && s640 != null) { small = s96; large = s640; save(s96, s640, true) }
+                    } else {
+                        // Same song, bitmap dropped for a moment (icon still there): keep the cover.
+                        if (sameSong) { small = track?.art; large = track?.artLarge }
+                        handler.removeCallbacks(recheck)
+                        handler.postDelayed(recheck, 2_100)
+                    }
+                }
+                sameSong -> {
+                    // The same song reported no artwork for a moment (players sometimes omit it): keep the
+                    // cover we have. A *different* song never reuses the previous one (Spotify's ads and
+                    // back-to-back tracks send the new title first and the artwork a beat later; showing
+                    // the old cover there read as "wrong song", while the placeholder reads as "loading").
+                    if (missingArtKey != artKey) { missingArtKey = artKey; missingArtSince = now }
+                    if (now - missingArtSince < 4_000) {
+                        small = track?.art; large = track?.artLarge
+                        handler.removeCallbacks(recheck)
+                        handler.postDelayed(recheck, 4_100)
+                    }
                 }
             }
         }
@@ -206,6 +275,15 @@ class NowPlaying(private val context: Context) {
             positionAt = ps?.lastPositionUpdateTime?.takeIf { it > 0 } ?: SystemClock.elapsedRealtime(),
             speed = ps?.playbackSpeed?.takeIf { it > 0f } ?: 1f,
         )
+    }
+
+    /** Cheap content fingerprint (an 8x8 thumbnail): tells whether two reports hold the same picture. */
+    private fun fingerprintOf(b: Bitmap?): Long {
+        if (b == null) return 0
+        val s = runCatching { Bitmap.createScaledBitmap(b, 8, 8, true) }.getOrNull() ?: return 0
+        val px = IntArray(64)
+        s.getPixels(px, 0, 8, 0, 0, 8, 8)
+        return px.fold(7L) { h, c -> h * 31 + c }
     }
 
     companion object {
